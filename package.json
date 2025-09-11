@@ -1,6 +1,6 @@
 {
   "name": "aistand",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "A CLI tool to summarize Git commits for daily stand-ups using AI.",
   "main": "index.js",
   "scripts": {

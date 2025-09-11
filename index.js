@@ -71,18 +71,41 @@ function calculateDateRange(targetDate = null) {
 
 async function fetchCommits(repoPath = '.', author, dateRange) {
   try {
+    // Use --format=%B to get full commit message (including body for multiline commits)
+    // Use --pretty=format: to ensure proper separation between commits
     const { stdout } = await execa('git', [
       'log',
       `--author=${author}`,
       `--since="${dateRange.start}"`,
       `--until="${dateRange.end}"`,
-      '--format=%s',
+      '--pretty=format:%H%n%s%n%b%n---COMMIT_SEPARATOR---%n',
       '--no-merges'
     ], { cwd: repoPath });
 
-    return stdout.trim().split('\n').filter(commit => commit.length > 0);
+    if (!stdout.trim()) {
+      return [];
+    }
+
+    // Split commits by separator and parse each one
+    const commitBlocks = stdout.trim().split('---COMMIT_SEPARATOR---\n').filter(block => block.trim());
+
+    const commits = [];
+    for (const block of commitBlocks) {
+      const lines = block.trim().split('\n');
+      if (lines.length >= 2) {
+        const hash = lines[0];
+        const subject = lines[1];
+        const body = lines.slice(2).join('\n').trim();
+
+        // Combine subject and body for multiline commits
+        const fullMessage = body ? `${subject}\n\n${body}` : subject;
+        commits.push(fullMessage);
+      }
+    }
+
+    return commits;
   } catch (error) {
-    if (error.stderr.includes('fatal: not a git repository')) {
+    if (error.stderr && error.stderr.includes('fatal: not a git repository')) {
       throw new Error('Not a Git repository. Please run this command from within a Git repository.');
     }
     return [];
@@ -100,8 +123,14 @@ async function generateSummary(commits) {
     return summary;
   }
 
-  const commitsText = commits.join('\n');
-  const systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with 'Yesterday, I...' and use bullet points for the key activities. Keep it brief and business-focused. Include ticket number like CC-1234 from related commit messages`;
+  const commitsText = commits.join('\n\n---\n\n');
+  const jiraTickets = extractJiraTickets(commits);
+
+  let systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with 'Yesterday, I...' and use bullet points for the key activities. Keep it brief and business-focused.`;
+
+  if (jiraTickets.length > 0) {
+    systemPrompt += ` Also mention any Jira tickets referenced in the commits.`;
+  }
 
   const userPrompt = `Please summarize these Git commit messages:\n\n${commitsText}`;
 
@@ -112,14 +141,36 @@ async function generateSummary(commits) {
     ]);
 
     const response = await result.response;
-    return response.text().trim();
+    let summary = response.text().trim();
+
+    // Add Jira tickets to the summary if not already included
+    if (jiraTickets.length > 0 && !summary.includes(jiraTickets[0])) {
+      summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
+    }
+
+    return summary;
   } catch (error) {
     throw new Error(`Failed to generate summary: ${error.message}`);
   }
 }
 
+function extractJiraTickets(commits) {
+  const jiraPattern = /\b([A-Z]+-\d+)\b/g;
+  const tickets = new Set();
+
+  for (const commit of commits) {
+    const matches = commit.match(jiraPattern);
+    if (matches) {
+      matches.forEach(ticket => tickets.add(ticket));
+    }
+  }
+
+  return Array.from(tickets).sort();
+}
+
 function generateDemoSummary(commits) {
   const summaryPoints = [];
+  const jiraTickets = extractJiraTickets(commits);
 
   for (const commit of commits) {
     if (commit.toLowerCase().includes('feat')) {
@@ -138,7 +189,14 @@ function generateDemoSummary(commits) {
   // Remove duplicates and format
   const uniquePoints = [...new Set(summaryPoints)];
 
-  return `Yesterday, I...\n${uniquePoints.map(point => `- ${point}`).join('\n')}`;
+  let summary = `Yesterday, I...\n${uniquePoints.map(point => `- ${point}`).join('\n')}`;
+
+  // Add Jira tickets if found
+  if (jiraTickets.length > 0) {
+    summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
+  }
+
+  return summary;
 }
 
 async function main() {
@@ -164,10 +222,24 @@ async function main() {
 
     console.log(`📝 Found ${commits.length} commit(s)`);
 
+    // Extract Jira tickets
+    const jiraTickets = extractJiraTickets(commits);
+    if (jiraTickets.length > 0) {
+      console.log(`🎫 Jira Tickets: ${jiraTickets.join(', ')}`);
+    }
+
     if (options.verbose) {
       console.log('\n📋 Raw commits:');
       commits.forEach((commit, index) => {
-        console.log(`${index + 1}. ${commit}`);
+        const lines = commit.split('\n');
+        console.log(`${index + 1}. ${lines[0]}`); // Show subject line
+        if (lines.length > 1) {
+          // Filter out any separator artifacts and show body with indentation
+          const bodyLines = lines.slice(1).filter(line => !line.includes('---COMMIT_SEPARATOR---'));
+          if (bodyLines.length > 0) {
+            console.log(`   ${bodyLines.join('\n   ')}`); // Show body with indentation
+          }
+        }
       });
       console.log('');
     }
@@ -181,6 +253,9 @@ async function main() {
     console.log('📊 STAND-UP SUMMARY');
     console.log('='.repeat(50));
     console.log(summary);
+    if (jiraTickets.length > 0) {
+      console.log(`\n🎫 Related Jira Tickets: ${jiraTickets.join(', ')}`);
+    }
     console.log('='.repeat(50));
 
   } catch (error) {
