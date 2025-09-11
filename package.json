@@ -2,6 +2,16 @@
   "name": "aistand",
   "version": "0.0.4",
   "description": "A CLI tool to summarize Git commits for daily stand-ups using AI.",
+  "contributors": [
+    "Armandas B",
+    "Justinas B",
+    "Nerijus P",
+    "Vytenis K"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FDiskas/aistand.git"
+  },
   "main": "index.js",
   "scripts": {
     "start": "bun run index.js"
