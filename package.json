@@ -3,10 +3,10 @@
   "version": "0.0.4",
   "description": "A CLI tool to summarize Git commits for daily stand-ups using AI.",
   "contributors": [
-    "Armandas B",
-    "Justinas B",
-    "Nerijus P",
-    "Vytenis K"
+    { "name": "Armandas B" },
+    { "name": "Justinas B" },
+    { "name": "Nerijus P" },
+    { "name": "Vytenis K", "url": "https://github.com/FDiskas" }
   ],
   "repository": {
     "type": "git",
