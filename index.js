@@ -4,17 +4,25 @@ import { Command } from 'commander';
 import { execa } from 'execa';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { format, subDays, isWeekend, previousFriday, startOfDay, endOfDay } from 'date-fns';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const packageJson = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
 
 const program = new Command();
 
 program
-  .name('standup-summary')
+  .name('aistand')
   .description('A CLI tool to summarize your Git commits for daily stand-ups.')
-  .version('0.0.1')
+  .version(packageJson.version, '-v, --version', 'output the version number')
   .option('-d, --date <date>', 'Specify a particular date (YYYY-MM-DD) instead of previous workday')
   .option('-p, --path <path>', 'Path to Git repository (defaults to current directory)')
-  .option('-v, --verbose', 'Show raw commit messages before summary')
-  .option('-k, --api-key <key>', 'Gemini API key (can also be set as GEMINI_API_KEY env var)');
+  .option('--verbose', 'Show raw commit messages before summary')
+  .option('-k, --api-key <key>', 'Gemini API key (can also be set as GEMINI_API_KEY env var)')
+  .option('--demo', 'Force demo mode (ignore API key)');
 
 program.parse(process.argv);
 
@@ -22,7 +30,7 @@ const options = program.opts();
 
 // Get Gemini API key
 const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
-const demoMode = !apiKey;
+const demoMode = options.demo || !apiKey || apiKey.trim() === '';
 
 if (demoMode) {
   console.log('🚀 Running in demo mode (no API key provided)');
@@ -47,26 +55,64 @@ async function getGitUser() {
 }
 
 function calculateDateRange(targetDate = null) {
-  let date = targetDate ? new Date(targetDate) : new Date();
+  const today = new Date();
+  let startDate, endDate;
 
-  // If no specific date provided, get previous workday
-  if (!targetDate) {
-    date = subDays(date, 1); // Yesterday
+  if (targetDate) {
+    // If specific date provided, use that date only
+    const date = new Date(targetDate);
+    startDate = startOfDay(date);
+    endDate = endOfDay(date);
+  } else {
+    // Include both previous workday and today
+    let previousWorkday = subDays(today, 1); // Yesterday
 
     // If yesterday was a weekend, get Friday
-    if (isWeekend(date)) {
-      date = previousFriday(date);
+    if (isWeekend(previousWorkday)) {
+      previousWorkday = previousFriday(previousWorkday);
     }
-  }
 
-  const startDate = startOfDay(date);
-  const endDate = endOfDay(date);
+    // Start from previous workday, end at end of today
+    startDate = startOfDay(previousWorkday);
+    endDate = endOfDay(today);
+  }
 
   return {
     start: format(startDate, 'yyyy-MM-dd HH:mm:ss'),
     end: format(endDate, 'yyyy-MM-dd HH:mm:ss'),
-    displayDate: format(date, 'yyyy-MM-dd')
+    displayDate: targetDate ? format(new Date(targetDate), 'yyyy-MM-dd') : `${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')}`
   };
+}
+
+function getDateRelativeText(commits) {
+  if (commits.length === 0) return 'Recently, I';
+
+  // Get the commit dates to determine the appropriate prefix
+  const today = format(new Date(), 'yyyy-MM-dd');
+  const yesterday = format(subDays(new Date(), 1), 'yyyy-MM-dd');
+  
+  // Check if we have commits from multiple days
+  const hasToday = commits.some(commit => commit.date === today);
+  const hasYesterday = commits.some(commit => commit.date === yesterday);
+  
+  if (hasToday && hasYesterday) {
+    return 'Recently, I';
+  } else if (hasToday) {
+    return 'Today, I';
+  } else {
+    // Determine the day name for the commits
+    const commitDate = new Date(commits[0].date);
+    const daysDiff = Math.floor((new Date() - commitDate) / (1000 * 60 * 60 * 24));
+    
+    if (daysDiff === 1) {
+      return 'Yesterday, I';
+    } else if (daysDiff <= 7) {
+      const dayName = format(commitDate, 'EEEE'); // Monday, Tuesday, etc.
+      return `On ${dayName}, I`;
+    } else {
+      return 'Recently, I';
+    }
+  }
 }
 
 async function fetchCommits(repoPath = '.', author, dateRange) {
@@ -78,7 +124,8 @@ async function fetchCommits(repoPath = '.', author, dateRange) {
       `--author=${author}`,
       `--since="${dateRange.start}"`,
       `--until="${dateRange.end}"`,
-      '--pretty=format:%H%n%s%n%b%n---COMMIT_SEPARATOR---%n',
+      '--pretty=format:%H%n%ad%n%s%n%b%n---COMMIT_SEPARATOR---%n',
+      '--date=short',
       '--no-merges'
     ], { cwd: repoPath });
 
@@ -92,14 +139,15 @@ async function fetchCommits(repoPath = '.', author, dateRange) {
     const commits = [];
     for (const block of commitBlocks) {
       const lines = block.trim().split('\n');
-      if (lines.length >= 2) {
+      if (lines.length >= 3) {
         const hash = lines[0];
-        const subject = lines[1];
-        const body = lines.slice(2).join('\n').trim();
+        const date = lines[1];
+        const subject = lines[2];
+        const body = lines.slice(3).join('\n').trim();
 
         // Combine subject and body for multiline commits
         const fullMessage = body ? `${subject}\n\n${body}` : subject;
-        commits.push(fullMessage);
+        commits.push({ message: fullMessage, date, hash });
       }
     }
 
@@ -123,10 +171,11 @@ async function generateSummary(commits) {
     return summary;
   }
 
-  const commitsText = commits.join('\n\n---\n\n');
+  const commitsText = commits.map(c => typeof c === 'string' ? c : c.message).join('\n\n---\n\n');
   const jiraTickets = extractJiraTickets(commits);
+  const datePrefix = getDateRelativeText(commits);
 
-  let systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with 'Yesterday, I...' and use bullet points for the key activities. Keep it brief and business-focused.`;
+  let systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with '${datePrefix}...' and use bullet points for the key activities. Keep it brief and business-focused.`;
 
   if (jiraTickets.length > 0) {
     systemPrompt += ` Also mention any Jira tickets referenced in the commits.`;
@@ -159,7 +208,8 @@ function extractJiraTickets(commits) {
   const tickets = new Set();
 
   for (const commit of commits) {
-    const matches = commit.match(jiraPattern);
+    const message = typeof commit === 'string' ? commit : commit.message;
+    const matches = message.match(jiraPattern);
     if (matches) {
       matches.forEach(ticket => tickets.add(ticket));
     }
@@ -171,15 +221,17 @@ function extractJiraTickets(commits) {
 function generateDemoSummary(commits) {
   const summaryPoints = [];
   const jiraTickets = extractJiraTickets(commits);
+  const datePrefix = getDateRelativeText(commits);
 
   for (const commit of commits) {
-    if (commit.toLowerCase().includes('feat')) {
+    const message = typeof commit === 'string' ? commit : commit.message;
+    if (message.toLowerCase().includes('feat')) {
       summaryPoints.push('Implemented new features and functionality');
-    } else if (commit.toLowerCase().includes('fix')) {
+    } else if (message.toLowerCase().includes('fix')) {
       summaryPoints.push('Fixed bugs and resolved issues');
-    } else if (commit.toLowerCase().includes('refactor')) {
+    } else if (message.toLowerCase().includes('refactor')) {
       summaryPoints.push('Improved code structure and performance');
-    } else if (commit.toLowerCase().includes('chore')) {
+    } else if (message.toLowerCase().includes('chore')) {
       summaryPoints.push('Updated dependencies and maintenance tasks');
     } else {
       summaryPoints.push('Made various improvements to the codebase');
@@ -189,7 +241,7 @@ function generateDemoSummary(commits) {
   // Remove duplicates and format
   const uniquePoints = [...new Set(summaryPoints)];
 
-  let summary = `Yesterday, I...\n${uniquePoints.map(point => `- ${point}`).join('\n')}`;
+  let summary = `${datePrefix}...\n${uniquePoints.map(point => `- ${point}`).join('\n')}`;
 
   // Add Jira tickets if found
   if (jiraTickets.length > 0) {
@@ -228,11 +280,13 @@ async function main() {
       console.log(`🎫 Jira Tickets: ${jiraTickets.join(', ')}`);
     }
 
-    if (options.verbose) {
+    if (options.verbose || demoMode) {
       console.log('\n📋 Raw commits:');
       commits.forEach((commit, index) => {
-        const lines = commit.split('\n');
-        console.log(`${index + 1}. ${lines[0]}`); // Show subject line
+        const message = typeof commit === 'string' ? commit : commit.message;
+        const date = typeof commit === 'object' ? commit.date : '';
+        const lines = message.split('\n');
+        console.log(`${index + 1}. ${lines[0]} ${date ? `(${date})` : ''}`); // Show subject line with date
         if (lines.length > 1) {
           // Filter out any separator artifacts and show body with indentation
           const bodyLines = lines.slice(1).filter(line => !line.includes('---COMMIT_SEPARATOR---'));
@@ -244,19 +298,21 @@ async function main() {
       console.log('');
     }
 
-    console.log('🤖 Generating AI summary...');
+    if (!demoMode) {
+      console.log('🤖 Generating AI summary...');
 
-    // Generate summary
-    const summary = await generateSummary(commits);
+      // Generate summary
+      const summary = await generateSummary(commits);
 
-    console.log('\n' + '='.repeat(50));
-    console.log('📊 STAND-UP SUMMARY');
-    console.log('='.repeat(50));
-    console.log(summary);
-    if (jiraTickets.length > 0) {
-      console.log(`\n🎫 Related Jira Tickets: ${jiraTickets.join(', ')}`);
+      console.log('\n' + '='.repeat(50));
+      console.log('📊 STAND-UP SUMMARY');
+      console.log('='.repeat(50));
+      console.log(summary);
+      if (jiraTickets.length > 0) {
+        console.log(`\n🎫 Related Jira Tickets: ${jiraTickets.join(', ')}`);
+      }
+      console.log('='.repeat(50));
     }
-    console.log('='.repeat(50));
 
   } catch (error) {
     console.error(`❌ Error: ${error.message}`);
