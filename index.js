@@ -2,7 +2,7 @@
 
 import { Command } from 'commander';
 import { execa } from 'execa';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 import { format, subDays, isWeekend, previousFriday, startOfDay, endOfDay } from 'date-fns';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -21,7 +21,9 @@ program
   .option('-d, --date <date>', 'Specify a particular date (YYYY-MM-DD) instead of previous workday')
   .option('-p, --path <path>', 'Path to Git repository (defaults to current directory)')
   .option('--verbose', 'Show raw commit messages before summary')
-  .option('-k, --api-key <key>', 'Gemini API key (can also be set as GEMINI_API_KEY env var)')
+  .option('-k, --api-key <key>', 'Gemini API key (set GEMINI_API_KEY or GOOGLE_API_KEY env vars)')
+  .option('--recent-branches <count>', 'Also scan N most recently updated local branches in addition to the current branch (use 0 to disable)', value => parseInt(value, 10))
+  .option('--model <name>', 'Override Gemini model (defaults to best available flash variant)')
   .option('--demo', 'Force demo mode (ignore API key)');
 
 program.parse(process.argv);
@@ -29,8 +31,25 @@ program.parse(process.argv);
 const options = program.opts();
 
 // Get Gemini API key
-const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
+const apiKey = options.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
 const demoMode = options.demo || !apiKey || apiKey.trim() === '';
+const DEFAULT_RECENT_BRANCHES = 3;
+const envRecentBranchesRaw = process.env.AISTAND_RECENT_BRANCHES;
+const envRecentBranches = envRecentBranchesRaw !== undefined ? parseInt(envRecentBranchesRaw, 10) : undefined;
+const requestedRecentBranches = options.recentBranches ?? envRecentBranches ?? DEFAULT_RECENT_BRANCHES;
+const recentBranchesCount = Number.isFinite(requestedRecentBranches)
+  ? Math.max(0, Math.floor(requestedRecentBranches))
+  : DEFAULT_RECENT_BRANCHES;
+const DEFAULT_MODEL_PREFERENCE = [
+  'gemini-2.0-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-8b'
+];
+const requestedModel = options.model || process.env.GEMINI_MODEL;
+const staticModelPreference = requestedModel ? [requestedModel] : DEFAULT_MODEL_PREFERENCE;
+const MAX_AI_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1200;
 
 if (demoMode) {
   console.log('🚀 Running in demo mode (no API key provided)');
@@ -38,11 +57,14 @@ if (demoMode) {
 }
 
 // Initialize Gemini AI (only if API key is available)
-let genAI, model;
+let aiClient;
 if (!demoMode) {
-  genAI = new GoogleGenerativeAI(apiKey);
-  model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+  aiClient = new GoogleGenAI({ apiKey });
 }
+
+let availableModelInfoPromise;
+let resolvedModelPreferencePromise;
+let modelListingWarningLogged = false;
 
 async function getGitUser() {
   try {
@@ -51,6 +73,47 @@ async function getGitUser() {
     return { name: name.trim(), email: email.trim() };
   } catch (error) {
     throw new Error('Could not get Git user configuration. Make sure you\'re in a Git repository and have configured user.name and user.email.');
+  }
+}
+
+async function getCurrentBranch(repoPath = '.') {
+  try {
+    const { stdout } = await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath });
+    return stdout.trim();
+  } catch (error) {
+    if (error.stderr && error.stderr.includes('not a git repository')) {
+      throw new Error('Not a Git repository. Please run this command from within a Git repository.');
+    }
+    throw new Error('Could not determine the current Git branch.');
+  }
+}
+
+async function getRecentLocalBranches(repoPath = '.', excludeBranch, limit = 0) {
+  if (!limit || limit <= 0) {
+    return [];
+  }
+
+  try {
+    const { stdout } = await execa('git', [
+      'for-each-ref',
+      '--format=%(refname:short)|%(committerdate:unix)',
+      '--sort=-committerdate',
+      'refs/heads'
+    ], { cwd: repoPath });
+
+    if (!stdout.trim()) {
+      return [];
+    }
+
+    return stdout
+      .trim()
+      .split('\n')
+      .map(line => line.split('|')[0])
+      .filter(branch => branch && branch !== excludeBranch)
+      .slice(0, limit);
+  } catch (error) {
+    console.warn('⚠️ Unable to list recent branches. Falling back to current branch only.');
+    return [];
   }
 }
 
@@ -115,43 +178,174 @@ function getDateRelativeText(commits) {
   }
 }
 
-async function fetchCommits(repoPath = '.', author, dateRange) {
-  try {
-    // Use --format=%B to get full commit message (including body for multiline commits)
-    // Use --pretty=format: to ensure proper separation between commits
-    const { stdout } = await execa('git', [
-      'log',
-      `--author=${author}`,
-      `--since="${dateRange.start}"`,
-      `--until="${dateRange.end}"`,
-      '--pretty=format:%H%n%ad%n%s%n%b%n---COMMIT_SEPARATOR---%n',
-      '--date=short',
-      '--no-merges'
-    ], { cwd: repoPath });
+function simplifyModelName(name) {
+  if (!name) return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  const segments = trimmed.split('/');
+  return segments[segments.length - 1];
+}
 
-    if (!stdout.trim()) {
-      return [];
+async function getAvailableModelInfo() {
+  if (!aiClient) return null;
+  if (!availableModelInfoPromise) {
+    availableModelInfoPromise = loadAvailableModelInfo();
+  }
+  return availableModelInfoPromise;
+}
+
+async function loadAvailableModelInfo() {
+  if (!aiClient) return null;
+  try {
+    const pager = await aiClient.models.list({
+      config: {
+        pageSize: 50,
+        queryBase: true
+      }
+    });
+    const simpleNames = new Set();
+    for await (const model of pager) {
+      const simplified = simplifyModelName(model?.name);
+      if (simplified) {
+        simpleNames.add(simplified);
+      }
+    }
+    return { simpleNames };
+  } catch (error) {
+    if (!modelListingWarningLogged) {
+      console.warn('⚠️ Unable to fetch model metadata automatically. Falling back to static preference.');
+      modelListingWarningLogged = true;
+    }
+    return null;
+  }
+}
+
+function buildDynamicModelPreference(simpleNames) {
+  if (!simpleNames || simpleNames.size === 0) {
+    return [];
+  }
+  const flashModels = Array.from(simpleNames).filter(name => {
+    if (!name) return false;
+    const lower = name.toLowerCase();
+    if (!lower.includes('gemini') || !lower.includes('flash')) return false;
+    return !isExperimentalModel(lower);
+  });
+  flashModels.sort((a, b) => scoreModelName(b) - scoreModelName(a));
+  return flashModels;
+}
+
+function isExperimentalModel(lowerName) {
+  return lowerName.includes('exp') || lowerName.includes('preview') || lowerName.includes('beta');
+}
+
+function scoreModelName(name) {
+  const lower = name.toLowerCase();
+  let score = 0;
+  if (lower.includes('flash')) score += 100;
+  if (lower.includes('2.0')) score += 40;
+  if (lower.includes('1.5')) score += 20;
+  if (lower.includes('latest')) score += 10;
+  if (isExperimentalModel(lower)) score -= 30;
+  if (lower.includes('8b') || lower.includes('lite') || lower.includes('mini')) score -= 5;
+  if (lower.includes('pro')) score -= 10; // prefer flash for quick summaries
+  return score;
+}
+
+function dedupeModelList(list) {
+  const result = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item) continue;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    result.push(item);
+  }
+  return result;
+}
+
+async function getResolvedModelPreference() {
+  if (resolvedModelPreferencePromise) {
+    return resolvedModelPreferencePromise;
+  }
+
+  resolvedModelPreferencePromise = (async () => {
+    if (requestedModel) {
+      return staticModelPreference;
     }
 
-    // Split commits by separator and parse each one
-    const commitBlocks = stdout.trim().split('---COMMIT_SEPARATOR---\n').filter(block => block.trim());
+    const modelInfo = await getAvailableModelInfo();
+    if (!modelInfo || !modelInfo.simpleNames || modelInfo.simpleNames.size === 0) {
+      return staticModelPreference;
+    }
 
-    const commits = [];
-    for (const block of commitBlocks) {
-      const lines = block.trim().split('\n');
-      if (lines.length >= 3) {
-        const hash = lines[0];
-        const date = lines[1];
-        const subject = lines[2];
-        const body = lines.slice(3).join('\n').trim();
+    const dynamicList = buildDynamicModelPreference(modelInfo.simpleNames);
+    const combined = dedupeModelList([...dynamicList, ...staticModelPreference]);
+    return combined.length > 0 ? combined : staticModelPreference;
+  })();
 
-        // Combine subject and body for multiline commits
-        const fullMessage = body ? `${subject}\n\n${body}` : subject;
-        commits.push({ message: fullMessage, date, hash });
+  return resolvedModelPreferencePromise;
+}
+
+async function fetchCommits(repoPath = '.', author, dateRange, branches = []) {
+  try {
+    const branchesToScan = (branches && branches.length > 0) ? branches : ['HEAD'];
+    const commitsByHash = new Map();
+
+    for (const branch of branchesToScan) {
+      const args = [
+        'log',
+        branch,
+        `--author=${author}`,
+        `--since=${dateRange.start}`,
+        `--until=${dateRange.end}`,
+        '--pretty=format:%H%n%ad%n%s%n%b%n---COMMIT_SEPARATOR---%n',
+        '--date=short',
+        '--no-merges'
+      ];
+
+      let stdout;
+      try {
+        ({ stdout } = await execa('git', args, { cwd: repoPath }));
+      } catch (branchError) {
+        if (branchError.stderr && branchError.stderr.includes('unknown revision or path')) {
+          console.warn(`⚠️ Branch ${branch} not found. Skipping.`);
+          continue;
+        }
+        throw branchError;
+      }
+
+      if (!stdout.trim()) {
+        continue;
+      }
+
+      const commitBlocks = stdout.trim().split('---COMMIT_SEPARATOR---\n').filter(block => block.trim());
+      for (const block of commitBlocks) {
+        const lines = block.trim().split('\n');
+        if (lines.length >= 3) {
+          const hash = lines[0];
+          const date = lines[1];
+          const subject = lines[2];
+          const body = lines.slice(3).join('\n').trim();
+          const fullMessage = body ? `${subject}\n\n${body}` : subject;
+
+          if (!commitsByHash.has(hash)) {
+            commitsByHash.set(hash, {
+              message: fullMessage,
+              date,
+              hash,
+              branches: new Set([branch])
+            });
+          } else {
+            commitsByHash.get(hash).branches.add(branch);
+          }
+        }
       }
     }
 
-    return commits;
+    return Array.from(commitsByHash.values()).map(commit => ({
+      ...commit,
+      branches: Array.from(commit.branches).sort()
+    }));
   } catch (error) {
     if (error.stderr && error.stderr.includes('fatal: not a git repository')) {
       throw new Error('Not a Git repository. Please run this command from within a Git repository.');
@@ -160,15 +354,70 @@ async function fetchCommits(repoPath = '.', author, dateRange) {
   }
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function extractStatusCode(error) {
+  return error?.status || error?.code || error?.cause?.status || error?.response?.status;
+}
+
+function isRetryableError(error) {
+  const status = extractStatusCode(error);
+  const message = (error?.message || '').toLowerCase();
+  return status === 429 || status === 500 || status === 503 || status === 'UNAVAILABLE' || status === 'RESOURCE_EXHAUSTED' || message.includes('temporarily') || message.includes('timeout');
+}
+
+function isQuotaOrPermissionError(error) {
+  const status = extractStatusCode(error);
+  const message = (error?.message || '').toLowerCase();
+  return status === 403 || status === 'PERMISSION_DENIED' || status === 'RESOURCE_EXHAUSTED' || message.includes('quota') || message.includes('billing') || message.includes('permission');
+}
+
+function isModelNotFound(error) {
+  const status = extractStatusCode(error);
+  const message = (error?.message || '').toLowerCase();
+  return status === 404 || status === 'NOT_FOUND' || message.includes('not found') || message.includes('unsupported');
+}
+
+async function callWithRetries(fn) {
+  let attempt = 0;
+  while (attempt < MAX_AI_RETRIES) {
+    try {
+      return await fn();
+    } catch (error) {
+      attempt += 1;
+      if (attempt >= MAX_AI_RETRIES || !isRetryableError(error)) {
+        throw error;
+      }
+      const waitTime = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.warn(`⚠️ AI request failed (attempt ${attempt}/${MAX_AI_RETRIES}). Retrying in ${Math.round(waitTime)}ms...`);
+      await sleep(waitTime);
+    }
+  }
+}
+
+function shouldFallbackToNextModel(error) {
+  return isQuotaOrPermissionError(error) || isModelNotFound(error);
+}
+
+function formatAggregateError(errors) {
+  if (errors.length === 0) return 'Unknown AI error.';
+  const lastError = errors[errors.length - 1];
+  const details = errors.map(({ model, message }) => `${model}: ${message}`).join(' | ');
+  return `AI summarization failed. Details: ${details}. Last error from ${lastError.model}: ${lastError.message}`;
+}
+
 async function generateSummary(commits) {
   if (commits.length === 0) {
-    return 'No commits found for the specified period.';
+    return { summary: 'No commits found for the specified period.', modelName: null };
   }
 
   if (demoMode) {
-    // Demo mode: generate a simple summary based on commit patterns
     const summary = generateDemoSummary(commits);
-    return summary;
+    return { summary, modelName: 'demo' };
+  }
+
+  if (!aiClient) {
+    throw new Error('Gemini client is not initialized. Please provide a valid API key.');
   }
 
   const commitsText = commits.map(c => typeof c === 'string' ? c : c.message).join('\n\n---\n\n');
@@ -182,25 +431,64 @@ async function generateSummary(commits) {
   }
 
   const userPrompt = `Please summarize these Git commit messages:\n\n${commitsText}`;
+  const modelsToTry = await getResolvedModelPreference();
+  const modelList = (modelsToTry && modelsToTry.length > 0) ? modelsToTry : staticModelPreference;
 
-  try {
-    const result = await model.generateContent([
-      { text: systemPrompt },
-      { text: userPrompt }
-    ]);
-
-    const response = await result.response;
-    let summary = response.text().trim();
-
-    // Add Jira tickets to the summary if not already included
-    if (jiraTickets.length > 0 && !summary.includes(jiraTickets[0])) {
-      summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
-    }
-
-    return summary;
-  } catch (error) {
-    throw new Error(`Failed to generate summary: ${error.message}`);
+  if (!modelList || modelList.length === 0) {
+    throw new Error('No Gemini models are available. Set --model or GEMINI_MODEL to specify one.');
   }
+
+  const errors = [];
+
+  for (let i = 0; i < modelList.length; i += 1) {
+    const modelName = modelList[i];
+    try {
+      const requestPayload = {
+        model: modelName,
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: userPrompt }]
+          }
+        ],
+        config: {
+          systemInstruction: {
+            role: 'system',
+            parts: [{ text: systemPrompt }]
+          }
+        }
+      };
+
+      const response = await callWithRetries(() => aiClient.models.generateContent(requestPayload));
+      let summary = extractResponseText(response);
+
+      if (!summary) {
+        throw new Error('Model returned an empty response.');
+      }
+
+      if (jiraTickets.length > 0 && !summary.includes(jiraTickets[0])) {
+        summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
+      }
+
+      return { summary, modelName };
+    } catch (error) {
+      const fallbackAvailable = i < modelList.length - 1;
+      errors.push({ model: modelName, message: error.message || 'Unknown error' });
+
+      if (fallbackAvailable && shouldFallbackToNextModel(error)) {
+        console.warn(`⚠️ Model ${modelName} is unavailable (${error.message || 'no message'}). Trying next model...`);
+        continue;
+      }
+
+      const hint = isQuotaOrPermissionError(error)
+        ? 'Check your Gemini API quota or select a different model with --model or GEMINI_MODEL.'
+        : 'Make sure the Gemini model name is correct and your API key has access to it.';
+
+      throw new Error(`Failed to generate summary with model ${modelName}: ${error.message || 'Unknown error'}. ${hint}`);
+    }
+  }
+
+  throw new Error(formatAggregateError(errors));
 }
 
 function extractJiraTickets(commits) {
@@ -216,6 +504,24 @@ function extractJiraTickets(commits) {
   }
 
   return Array.from(tickets).sort();
+}
+
+function extractResponseText(response) {
+  if (!response) return '';
+  if (typeof response.text === 'string' && response.text.trim()) {
+    return response.text.trim();
+  }
+
+  const parts = [];
+  response.candidates?.forEach(candidate => {
+    candidate?.content?.parts?.forEach(part => {
+      if (part?.text) {
+        parts.push(part.text);
+      }
+    });
+  });
+
+  return parts.join('\n').trim();
 }
 
 function generateDemoSummary(commits) {
@@ -265,7 +571,17 @@ async function main() {
 
     // Fetch commits
     const repoPath = options.path || '.';
-    const commits = await fetchCommits(repoPath, user.email, dateRange);
+    const currentBranch = await getCurrentBranch(repoPath);
+    const extraBranches = await getRecentLocalBranches(repoPath, currentBranch, recentBranchesCount);
+    const branchesToScan = Array.from(new Set([currentBranch, ...extraBranches]));
+
+    if (branchesToScan.length > 1) {
+      console.log(`🌿 Branches scanned: ${branchesToScan.join(', ')}`);
+    } else {
+      console.log(`🌿 Branch scanned: ${currentBranch}`);
+    }
+
+    const commits = await fetchCommits(repoPath, user.email, dateRange, branchesToScan);
 
     if (commits.length === 0) {
       console.log('❌ No commits found for the specified period.');
@@ -285,8 +601,11 @@ async function main() {
       commits.forEach((commit, index) => {
         const message = typeof commit === 'string' ? commit : commit.message;
         const date = typeof commit === 'object' ? commit.date : '';
+        const branchLabel = (commit.branches && commit.branches.length > 0)
+          ? ` [${commit.branches.join(', ')}]`
+          : '';
         const lines = message.split('\n');
-        console.log(`${index + 1}. ${lines[0]} ${date ? `(${date})` : ''}`); // Show subject line with date
+        console.log(`${index + 1}. ${lines[0]} ${date ? `(${date})` : ''}${branchLabel}`); // Show subject line with date and branches
         if (lines.length > 1) {
           // Filter out any separator artifacts and show body with indentation
           const bodyLines = lines.slice(1).filter(line => !line.includes('---COMMIT_SEPARATOR---'));
@@ -302,11 +621,15 @@ async function main() {
       console.log('🤖 Generating AI summary...');
 
       // Generate summary
-      const summary = await generateSummary(commits);
+      const { summary, modelName } = await generateSummary(commits);
 
       console.log('\n' + '='.repeat(50));
       console.log('📊 STAND-UP SUMMARY');
       console.log('='.repeat(50));
+      if (modelName) {
+        console.log(`🧠 Model: ${modelName}`);
+        console.log('-'.repeat(50));
+      }
       console.log(summary);
       if (jiraTickets.length > 0) {
         console.log(`\n🎫 Related Jira Tickets: ${jiraTickets.join(', ')}`);
