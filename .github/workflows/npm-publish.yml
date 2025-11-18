@@ -68,6 +68,16 @@ jobs:
           set -euo pipefail
           echo "@${OWNER}:registry=https://npm.pkg.github.com" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+      - name: Scope package name for GitHub Packages
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          ORIGINAL_NAME=$(node -p "require('./package.json').name")
+          echo "Original package name: ${ORIGINAL_NAME}"
+          SCOPED_NAME="@${OWNER}/${ORIGINAL_NAME}"
+          echo "Scoped package name: ${SCOPED_NAME}"
+          npm pkg set name="${SCOPED_NAME}"
       - name: Align package version with release tag
         env:
           TAG_NAME: ${{ github.event.release.tag_name }}
