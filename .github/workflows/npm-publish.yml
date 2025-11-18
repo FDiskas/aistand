@@ -60,6 +60,14 @@ jobs:
           node-version: 20
           registry-url: https://npm.pkg.github.com/
       - run: npm ci
+      - name: Configure npm for GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "@${OWNER}:registry=https://npm.pkg.github.com" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
       - name: Align package version with release tag
         env:
           TAG_NAME: ${{ github.event.release.tag_name }}
@@ -73,6 +81,6 @@ jobs:
           echo "Publishing version ${VERSION} from tag ${TAG_NAME}"
           npm version "$VERSION" --no-git-tag-version
       - name: Publish to GitHub Packages
-        run: npm publish
+        run: npm publish --registry=https://npm.pkg.github.com
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
