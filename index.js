@@ -40,14 +40,7 @@ const requestedRecentBranches = options.recentBranches ?? envRecentBranches ?? D
 const recentBranchesCount = Number.isFinite(requestedRecentBranches)
   ? Math.max(0, Math.floor(requestedRecentBranches))
   : DEFAULT_RECENT_BRANCHES;
-const DEFAULT_MODEL_PREFERENCE = [
-  'gemini-2.0-flash',
-  'gemini-1.5-flash-latest',
-  'gemini-1.5-flash',
-  'gemini-1.5-flash-8b'
-];
 const requestedModel = options.model || process.env.GEMINI_MODEL;
-const staticModelPreference = requestedModel ? [requestedModel] : DEFAULT_MODEL_PREFERENCE;
 const MAX_AI_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1200;
 
@@ -238,16 +231,29 @@ function isExperimentalModel(lowerName) {
   return lowerName.includes('exp') || lowerName.includes('preview') || lowerName.includes('beta');
 }
 
+function extractVersion(name) {
+  const match = name.match(/gemini-(\d+(?:\.\d+)?)/i);
+  return match ? parseFloat(match[1]) : 0;
+}
+
 function scoreModelName(name) {
   const lower = name.toLowerCase();
   let score = 0;
-  if (lower.includes('flash')) score += 100;
-  if (lower.includes('2.0')) score += 40;
-  if (lower.includes('1.5')) score += 20;
+
+  // Primary tiers
+  if (lower.endsWith('-flash')) score += 10000;
+  else if (lower.includes('flash')) score += 5000;
+
+  // Version priority (e.g. 2.5 -> 2500, 1.5 -> 1500)
+  const version = extractVersion(lower);
+  score += version * 1000;
+
+  // Minor adjustments
   if (lower.includes('latest')) score += 10;
   if (isExperimentalModel(lower)) score -= 30;
-  if (lower.includes('8b') || lower.includes('lite') || lower.includes('mini')) score -= 5;
-  if (lower.includes('pro')) score -= 10; // prefer flash for quick summaries
+  if (lower.includes('8b') || lower.includes('lite') || lower.includes('mini')) score -= 50;
+  if (lower.includes('pro')) score -= 100; // De-prioritize pro if we want flash
+
   return score;
 }
 
@@ -270,17 +276,17 @@ async function getResolvedModelPreference() {
 
   resolvedModelPreferencePromise = (async () => {
     if (requestedModel) {
-      return staticModelPreference;
+      return [requestedModel];
     }
 
     const modelInfo = await getAvailableModelInfo();
     if (!modelInfo || !modelInfo.simpleNames || modelInfo.simpleNames.size === 0) {
-      return staticModelPreference;
+      return []; // Caller will handle empty list
     }
 
     const dynamicList = buildDynamicModelPreference(modelInfo.simpleNames);
-    const combined = dedupeModelList([...dynamicList, ...staticModelPreference]);
-    return combined.length > 0 ? combined : staticModelPreference;
+    const combined = dedupeModelList([...dynamicList]); // No static fallback
+    return combined;
   })();
 
   return resolvedModelPreferencePromise;
@@ -396,7 +402,7 @@ async function callWithRetries(fn) {
 }
 
 function shouldFallbackToNextModel(error) {
-  return isQuotaOrPermissionError(error) || isModelNotFound(error);
+  return isQuotaOrPermissionError(error) || isModelNotFound(error) || isRetryableError(error);
 }
 
 function formatAggregateError(errors) {
@@ -432,7 +438,7 @@ async function generateSummary(commits) {
 
   const userPrompt = `Please summarize these Git commit messages:\n\n${commitsText}`;
   const modelsToTry = await getResolvedModelPreference();
-  const modelList = (modelsToTry && modelsToTry.length > 0) ? modelsToTry : staticModelPreference;
+  const modelList = modelsToTry || [];
 
   if (!modelList || modelList.length === 0) {
     throw new Error('No Gemini models are available. Set --model or GEMINI_MODEL to specify one.');
