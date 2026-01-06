@@ -38,10 +38,38 @@ if (demoMode) {
 }
 
 // Initialize Gemini AI (only if API key is available)
-let genAI, model;
-if (!demoMode) {
-  genAI = new GoogleGenerativeAI(apiKey);
-  model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+// Logic moved to generateSummaryWithRetry to allow dynamic model selection
+
+async function getAvailableModels(apiKey) {
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (!response.ok) {
+      // If listing fails, return a default fallback list
+      return ['models/gemini-2.0-flash-exp', 'models/gemini-1.5-flash'];
+    }
+    const data = await response.json();
+    if (!data.models) return [];
+
+    // Filter for models that generate content and prefer flash/recent models
+    const supportedModels = data.models
+      .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
+      .map(m => m.name);
+
+    // Sort to prioritize models ending in "-flash", then other flash variants
+    return supportedModels.sort((a, b) => {
+      const getScore = (name) => {
+        if (name.endsWith('-flash')) return 10;
+        if (name.includes('gemini-2.0-flash')) return 3;
+        if (name.includes('gemini-1.5-flash')) return 2;
+        if (name.includes('gemini-1.5-pro')) return 1;
+        return 0;
+      };
+      return getScore(b) - getScore(a);
+    });
+  } catch (error) {
+    // Fallback if fetch fails
+    return ['models/gemini-2.0-flash-exp', 'models/gemini-1.5-flash'];
+  }
 }
 
 async function getGitUser() {
@@ -160,47 +188,91 @@ async function fetchCommits(repoPath = '.', author, dateRange) {
   }
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function generateSummary(commits) {
   if (commits.length === 0) {
     return 'No commits found for the specified period.';
   }
 
   if (demoMode) {
-    // Demo mode: generate a simple summary based on commit patterns
-    const summary = generateDemoSummary(commits);
-    return summary;
+    return generateDemoSummary(commits);
   }
 
-  const commitsText = commits.map(c => typeof c === 'string' ? c : c.message).join('\n\n---\n\n');
-  const jiraTickets = extractJiraTickets(commits);
-  const datePrefix = getDateRelativeText(commits);
-
-  let systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with '${datePrefix}...' and use bullet points for the key activities. Keep it brief and business-focused.`;
-
-  if (jiraTickets.length > 0) {
-    systemPrompt += ` Also mention any Jira tickets referenced in the commits.`;
+  // Get available models
+  let availableModels = await getAvailableModels(apiKey);
+  if (availableModels.length === 0) {
+     // Hard fallback if API listing fails completely
+     availableModels = ['models/gemini-2.0-flash-exp', 'models/gemini-1.5-flash'];
   }
+  
+  // Ensure we try at least a few models
+  const maxRetries = 3;
+  let lastError = null;
 
-  const userPrompt = `Please summarize these Git commit messages:\n\n${commitsText}`;
+  for (const modelName of availableModels) {
+    // Clean model name for SDK (SDK usually expects 'gemini-pro', API returns 'models/gemini-pro')
+    const cleanModelName = modelName.startsWith('models/') ? modelName.replace('models/', '') : modelName;
+    
+    // We try each model up to maxRetries times with backoff
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: cleanModelName });
 
-  try {
-    const result = await model.generateContent([
-      { text: systemPrompt },
-      { text: userPrompt }
-    ]);
+        const commitsText = commits.map(c => typeof c === 'string' ? c : c.message).join('\n\n---\n\n');
+        const jiraTickets = extractJiraTickets(commits);
+        const datePrefix = getDateRelativeText(commits);
 
-    const response = await result.response;
-    let summary = response.text().trim();
+        let systemPrompt = `You are an expert project manager. Your task is to convert a list of raw Git commit messages from a developer into a concise, high-level summary. This summary will be read during a daily stand-up meeting to a non-technical audience. Focus on the impact and progress rather than the technical details. Group related changes into a single point. Start the summary with '${datePrefix}...' and use bullet points for the key activities. Keep it brief and business-focused.`;
 
-    // Add Jira tickets to the summary if not already included
-    if (jiraTickets.length > 0 && !summary.includes(jiraTickets[0])) {
-      summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
+        if (jiraTickets.length > 0) {
+          systemPrompt += ` Also mention any Jira tickets referenced in the commits.`;
+        }
+
+        const userPrompt = `Please summarize these Git commit messages:\n\n${commitsText}`;
+
+        const result = await model.generateContent([
+          { text: systemPrompt },
+          { text: userPrompt }
+        ]);
+
+        const response = await result.response;
+        let summary = response.text().trim();
+
+        // Add Jira tickets to the summary if not already included
+        if (jiraTickets.length > 0 && !summary.includes(jiraTickets[0])) {
+          summary += `\n\nJira Tickets: ${jiraTickets.join(', ')}`;
+        }
+        
+        // Log successful model usage
+        console.log(`\n🧠 Model: ${cleanModelName}`);
+
+        return summary;
+
+      } catch (error) {
+        lastError = error;
+        const isQuotaError = error.message.includes('429') || error.message.includes('Quota exceeded') || error.status === 429;
+        
+        if (isQuotaError) {
+             const delay = attempt * 1200;
+             console.log(`⚠️ AI request failed (attempt ${attempt}/${maxRetries}). Retrying in ${delay}ms...`);
+             await sleep(delay);
+             // Verify if we should fallback to next model immediately for 429? 
+             // Logic in logs suggests it retries same model a few times then switches.
+             if (attempt === maxRetries) {
+                 console.log(`⚠️ Model ${cleanModelName} is unavailable (${error.message}). Trying next model...`);
+             }
+        } else {
+            // Non-quota error, maybe try next model immediately
+            console.log(`⚠️ Model ${cleanModelName} error: ${error.message}. Trying next model...`);
+            break; // Break inner loop to try next model
+        }
+      }
     }
-
-    return summary;
-  } catch (error) {
-    throw new Error(`Failed to generate summary: ${error.message}`);
   }
+
+  throw new Error(`Failed to generate summary after trying multiple models. Last error: ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
 function extractJiraTickets(commits) {
@@ -308,8 +380,12 @@ async function main() {
       console.log('📊 STAND-UP SUMMARY');
       console.log('='.repeat(50));
       console.log(summary);
-      if (jiraTickets.length > 0) {
-        console.log(`\n🎫 Related Jira Tickets: ${jiraTickets.join(', ')}`);
+      if (jiraTickets.length > 0 && !summary.includes('Related Jira Tickets')) {
+         // Check if summary already has it, logic inside generateSummary adds it
+         // but just to be sure we match original output format
+         // Actually generateSummary returns the whole text. 
+         // The original code had separate log for tickets if not in summary.
+         // Let's rely on generateSummary to include it or not.
       }
       console.log('='.repeat(50));
     }
