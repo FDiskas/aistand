@@ -47,7 +47,9 @@ jobs:
           echo "Publishing version ${VERSION} from tag ${TAG_NAME}"
           npm version "$VERSION" --no-git-tag-version
       - name: Publish to npm
-        run: npm publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-gpr:
     needs: build
